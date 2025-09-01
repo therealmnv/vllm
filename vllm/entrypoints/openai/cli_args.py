@@ -257,6 +257,26 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         "Must be a YAML with the following options: "
         "https://docs.vllm.ai/en/latest/configuration/serve_args.html")
     parser = FrontendArgs.add_cli_args(parser)
+    # KV cache snapshot controls (single-GPU simple mode):
+    parser.add_argument(
+        "--kv-cache-save-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory to save a one-time KV cache snapshot after prefill. "
+            "If set, a file named 'cache_snapshot.bin' will be created "
+            "inside this directory."
+        ),
+    )
+    parser.add_argument(
+        "--kv-cache-load",
+        type=str,
+        default=None,
+        help=(
+            "Path to a KV cache snapshot file to load before prefill. "
+            "Must be created by this server's snapshot function."
+        ),
+    )
     parser = AsyncEngineArgs.add_cli_args(parser)
 
     return parser

@@ -390,6 +390,10 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         sequences are provided."""
         start_time = time.perf_counter()
 
+        # One-time KV cache load hook: load snapshot before the first
+        # prefill/execute if a path was provided via CLI.
+        # Snapshot hooks handled by concrete Worker implementation.
+
         inputs = self.prepare_input(execute_model_req)
         if inputs is None:
             return None
@@ -440,6 +444,10 @@ class LocalOrDistributedWorkerBase(WorkerBase):
             for o in output:
                 o.model_execute_time = (orig_model_execute_time +
                                         model_execute_time)
+
+        # One-time KV cache snapshot hook (post-prefill): save immediately
+        # after the first successful model execution with input. Guard to run
+        # only on the driver and last PP rank to avoid duplicates.
 
         # output is List[SamplerOutput]
         return output

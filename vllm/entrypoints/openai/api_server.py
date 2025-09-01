@@ -118,6 +118,23 @@ logger = init_logger('vllm.entrypoints.openai.api_server')
 _running_tasks: set[asyncio.Task] = set()
 
 
+ 
+def _opt_log_error_stack_kwargs(cls, args: Namespace) -> dict[str, Any]:
+    """Return {log_error_stack: bool} if the class __init__ supports it.
+
+    This keeps compatibility with older vLLM installs that don't yet accept
+    the 'log_error_stack' kwarg in serving classes.
+    """
+    try:
+        params = inspect.signature(cls.__init__).parameters
+        if 'log_error_stack' in params:
+            return {'log_error_stack': args.log_error_stack}
+    except (ValueError, TypeError):
+        # Fallback: if we cannot introspect, don't pass the kwarg.
+        pass
+    return {}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -1749,7 +1766,7 @@ async def init_app_state(
         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
         enable_force_include_usage=args.enable_force_include_usage,
         enable_log_outputs=args.enable_log_outputs,
-        log_error_stack=args.log_error_stack,
+        **_opt_log_error_stack_kwargs(OpenAIServingResponses, args),
     ) if "generate" in supported_tasks else None
     state.openai_serving_chat = OpenAIServingChat(
         engine_client,
@@ -1768,7 +1785,7 @@ async def init_app_state(
         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
         enable_force_include_usage=args.enable_force_include_usage,
         enable_log_outputs=args.enable_log_outputs,
-        log_error_stack=args.log_error_stack,
+        **_opt_log_error_stack_kwargs(OpenAIServingChat, args),
     ) if "generate" in supported_tasks else None
     state.openai_serving_completion = OpenAIServingCompletion(
         engine_client,
@@ -1778,7 +1795,7 @@ async def init_app_state(
         return_tokens_as_token_ids=args.return_tokens_as_token_ids,
         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
         enable_force_include_usage=args.enable_force_include_usage,
-        log_error_stack=args.log_error_stack,
+        **_opt_log_error_stack_kwargs(OpenAIServingCompletion, args),
     ) if "generate" in supported_tasks else None
     state.openai_serving_pooling = OpenAIServingPooling(
         engine_client,
@@ -1787,7 +1804,7 @@ async def init_app_state(
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
-        log_error_stack=args.log_error_stack,
+        **_opt_log_error_stack_kwargs(OpenAIServingPooling, args),
     ) if "encode" in supported_tasks else None
     state.openai_serving_embedding = OpenAIServingEmbedding(
         engine_client,
@@ -1796,21 +1813,21 @@ async def init_app_state(
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
-        log_error_stack=args.log_error_stack,
+        **_opt_log_error_stack_kwargs(OpenAIServingEmbedding, args),
     ) if "embed" in supported_tasks else None
     state.openai_serving_classification = ServingClassification(
         engine_client,
         model_config,
         state.openai_serving_models,
         request_logger=request_logger,
-        log_error_stack=args.log_error_stack,
+        **_opt_log_error_stack_kwargs(ServingClassification, args),
     ) if "classify" in supported_tasks else None
     state.openai_serving_scores = ServingScores(
         engine_client,
         model_config,
         state.openai_serving_models,
         request_logger=request_logger,
-        log_error_stack=args.log_error_stack,
+        **_opt_log_error_stack_kwargs(ServingScores, args),
     ) if ("embed" in supported_tasks or "score" in supported_tasks) else None
     state.openai_serving_tokenization = OpenAIServingTokenization(
         engine_client,
@@ -1819,21 +1836,21 @@ async def init_app_state(
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
-        log_error_stack=args.log_error_stack,
+        **_opt_log_error_stack_kwargs(OpenAIServingTokenization, args),
     )
     state.openai_serving_transcription = OpenAIServingTranscription(
         engine_client,
         model_config,
         state.openai_serving_models,
         request_logger=request_logger,
-        log_error_stack=args.log_error_stack,
+        **_opt_log_error_stack_kwargs(OpenAIServingTranscription, args),
     ) if "transcription" in supported_tasks else None
     state.openai_serving_translation = OpenAIServingTranslation(
         engine_client,
         model_config,
         state.openai_serving_models,
         request_logger=request_logger,
-        log_error_stack=args.log_error_stack,
+        **_opt_log_error_stack_kwargs(OpenAIServingTranslation, args),
     ) if "transcription" in supported_tasks else None
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
@@ -1942,6 +1959,25 @@ async def run_server_worker(listen_address,
     log_config = load_log_config(args.log_config_file)
     if log_config is not None:
         uvicorn_kwargs['log_config'] = log_config
+
+    # Apply KV cache snapshot controls via environment for worker hook.
+    # --kv-cache-save-dir: set VLLM_KV_SNAPSHOT_PATH to dir/cache_snapshot.bin
+    if getattr(args, "kv_cache_save_dir", None):
+        save_dir = args.kv_cache_save_dir
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+        except Exception as e:
+            logger.warning("Failed to create snapshot dir %s: %s", save_dir,
+                           e)
+        snapshot_path = os.path.join(save_dir, "cache_snapshot.bin")
+        os.environ["VLLM_KV_SNAPSHOT_PATH"] = snapshot_path
+        logger.info("KV cache snapshot will be saved to %s", snapshot_path)
+
+    # --kv-cache-load: set VLLM_KV_SNAPSHOT_LOAD to a file path
+    if getattr(args, "kv_cache_load", None):
+        os.environ["VLLM_KV_SNAPSHOT_LOAD"] = args.kv_cache_load
+        logger.info("KV cache snapshot will be loaded from %s",
+                    args.kv_cache_load)
 
     async with build_async_engine_client(
             args,

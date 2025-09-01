@@ -15,7 +15,7 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
-                              set_custom_all_reduce)
+                              set_custom_all_reduce, get_pp_group)
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -118,6 +118,19 @@ class Worker(LocalOrDistributedWorkerBase):
                     torch_profiler_trace_dir, use_gzip=True))
         else:
             self.profiler = None
+
+    # KV cache snapshot controls (single-GPU/simple use case).
+    # Set via environment variables to keep CLI integration minimal.
+    # VLLM_KV_SNAPSHOT_LOAD: file path to load before first execute
+    # VLLM_KV_SNAPSHOT_PATH: file path to save after first
+    # successful prefill
+        self._kv_snapshot_load_path: Optional[str] = os.environ.get(
+            "VLLM_KV_SNAPSHOT_LOAD")
+        self._kv_snapshot_loaded: bool = False
+        self._kv_snapshot_path: Optional[str] = os.environ.get(
+            "VLLM_KV_SNAPSHOT_PATH")
+        self._kv_snapshot_done: bool = False
+        self._last_ve: Optional[int] = None
 
     def start_profile(self):
         if self.profiler is None:
@@ -331,6 +344,27 @@ class Worker(LocalOrDistributedWorkerBase):
             self._init_cache_engine()
         self._warm_up_model()
 
+        # Eagerly load KV snapshot after warm-up if requested so it's ready
+        # as soon as the server starts (one-time load).
+        if (self._kv_snapshot_load_path and not self._kv_snapshot_loaded
+                and getattr(self, "cache_engine", None) is not None
+                and getattr(self, "gpu_cache", None) is not None):
+            try:
+                for ve in range(self.parallel_config.pipeline_parallel_size):
+                    self.cache_engine[ve].load_gpu_cache(
+                        self._kv_snapshot_load_path)
+                logger.info(
+                    "Loaded KV cache snapshot from %s into %d VEs (startup)",
+                    self._kv_snapshot_load_path,
+                    self.parallel_config.pipeline_parallel_size,
+                )
+                self._kv_snapshot_loaded = True
+            except Exception:
+                logger.exception(
+                    "KV cache snapshot load failed from %s during startup",
+                    self._kv_snapshot_load_path,
+                )
+
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None
         self.cache_engine = [
@@ -426,6 +460,8 @@ class Worker(LocalOrDistributedWorkerBase):
     @torch.inference_mode()
     def execute_worker(self, worker_input: WorkerInput) -> None:
         virtual_engine = worker_input.virtual_engine
+        # Remember last VE that received work; used by snapshot hook.
+        self._last_ve = virtual_engine
         # Issue cache operations.
         if (worker_input.blocks_to_swap_in is not None
                 and worker_input.blocks_to_swap_in.numel() > 0):
@@ -437,7 +473,8 @@ class Worker(LocalOrDistributedWorkerBase):
                 worker_input.blocks_to_swap_out)
         if (worker_input.blocks_to_copy is not None
                 and worker_input.blocks_to_copy.numel() > 0):
-            self.cache_engine[virtual_engine].copy(worker_input.blocks_to_copy)
+            self.cache_engine[virtual_engine].copy(
+                worker_input.blocks_to_copy)
 
     def _get_cached_seq_group_metadata(
             self,
@@ -494,6 +531,33 @@ class Worker(LocalOrDistributedWorkerBase):
                 new_seq_group_metadata_list)
         output = super()._execute_model_spmd(execute_model_req,
                                              intermediate_tensors)
+        return output
+
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        execute_model_req: Optional[ExecuteModelRequest] = None,
+    ) -> Optional[List[SamplerOutput]]:
+        # Delegate to base execution.
+        output = super().execute_model(execute_model_req)
+
+        # Save once after the first successful prefill if requested.
+        if (self._kv_snapshot_path and not self._kv_snapshot_done
+                and self.is_driver_worker and get_pp_group().is_last_rank
+                and output is not None and output != []):
+            try:
+                ve = self._last_ve if self._last_ve is not None else 0
+                self.cache_engine[ve].save_gpu_cache(
+                    self._kv_snapshot_path)
+                logger.info("Saved KV cache snapshot to %s (ve=%d)",
+                            self._kv_snapshot_path, ve)
+                self._kv_snapshot_done = True
+            except Exception:
+                logger.exception(
+                    "KV cache snapshot save failed to %s",
+                    self._kv_snapshot_path,
+                )
+
         return output
 
     def add_lora(self, lora_request: LoRARequest) -> bool:

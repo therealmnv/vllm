@@ -117,6 +117,70 @@ class CacheEngine:
     def copy(self, src_to_dsts: torch.Tensor) -> None:
         self.attn_backend.copy_blocks(self.gpu_cache, src_to_dsts)
 
+    # ------------------------------
+    # Simple GPU-only snapshot I/O
+    # ------------------------------
+    def save_gpu_cache(self, filepath: str) -> None:
+        """Save the entire GPU KV cache (all attention layers) to one file.
+
+        Serialization is intentionally simple for single-GPU use:
+        - Copies each GPU tensor to CPU and saves a Python list via torch.save.
+        - No extra metadata or manifests are written.
+
+        Args:
+            filepath: Destination file path (e.g., "/tmp/kv_cache.bin").
+        """
+        try:
+            # Ensure all device work is complete before snapshotting.
+            if (self.device_config.device_type != "cpu"
+                    and torch.cuda.is_available()):
+                torch.cuda.synchronize()
+
+            tensors = [
+                t.detach().to("cpu").contiguous() for t in self.gpu_cache
+            ]
+            torch.save(tensors, filepath)
+            logger.info("Saved GPU KV cache to %s (layers=%d)", filepath,
+                        len(tensors))
+        except Exception:
+            logger.exception("Failed to save GPU KV cache to %s", filepath)
+            raise
+
+    def load_gpu_cache(self, filepath: str) -> None:
+        """Load the entire GPU KV cache from a file created by save_gpu_cache.
+
+        This method expects shapes/dtypes to match the already-initialized
+        CacheEngine. It performs a direct copy_ into each layer tensor.
+
+        Args:
+            filepath: Source file path previously produced by save_gpu_cache.
+        """
+        try:
+            tensors = torch.load(filepath, map_location="cpu")
+            if not isinstance(tensors, list):
+                raise ValueError(
+                    f"Unexpected snapshot format in {filepath}: expected "
+                    f"list, got {type(tensors)}")
+            if len(tensors) != len(self.gpu_cache):
+                raise ValueError(
+                    "Snapshot layer count mismatch: got "
+                    f"{len(tensors)} tensors, expected {len(self.gpu_cache)}")
+
+            device = self.device_config.device_type
+            for i, src in enumerate(tensors):
+                dst = self.gpu_cache[i]
+                # Let PyTorch raise if shape/dtype mismatch occurs.
+                dst.copy_(src.to(device))
+
+            if device != "cpu" and torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+            logger.info("Loaded GPU KV cache from %s (layers=%d)", filepath,
+                        len(tensors))
+        except Exception:
+            logger.exception("Failed to load GPU KV cache from %s", filepath)
+            raise
+
     @staticmethod
     def get_cache_block_size(
         cache_config: CacheConfig,

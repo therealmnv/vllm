@@ -120,7 +120,7 @@ class CacheEngine:
     # ------------------------------
     # Simple GPU-only snapshot I/O
     # ------------------------------
-    def save_gpu_cache(self, filepath: str) -> None:
+    def save_gpu_cache(self, filepath: str, meta: dict | None = None) -> None:
         """Save the entire GPU KV cache (all attention layers) to one file.
 
         Serialization is intentionally simple for single-GPU use:
@@ -139,14 +139,20 @@ class CacheEngine:
             tensors = [
                 t.detach().to("cpu").contiguous() for t in self.gpu_cache
             ]
-            torch.save(tensors, filepath)
+            # Save as a dict for forward-compat to include metadata.
+            payload = {
+                "version": 1,
+                "tensors": tensors,
+                "meta": meta or None,
+            }
+            torch.save(payload, filepath)
             logger.info("Saved GPU KV cache to %s (layers=%d)", filepath,
                         len(tensors))
         except Exception:
             logger.exception("Failed to save GPU KV cache to %s", filepath)
             raise
 
-    def load_gpu_cache(self, filepath: str) -> None:
+    def load_gpu_cache(self, filepath: str) -> dict | None:
         """Load the entire GPU KV cache from a file created by save_gpu_cache.
 
         This method expects shapes/dtypes to match the already-initialized
@@ -156,11 +162,19 @@ class CacheEngine:
             filepath: Source file path previously produced by save_gpu_cache.
         """
         try:
-            tensors = torch.load(filepath, map_location="cpu")
-            if not isinstance(tensors, list):
+            loaded = torch.load(filepath, map_location="cpu")
+            meta = None
+            if isinstance(loaded, list):
+                # Backward-compat: legacy format saved a plain list.
+                tensors = loaded
+            elif isinstance(loaded, dict) and "tensors" in loaded:
+                tensors = loaded["tensors"]
+                meta = loaded.get("meta")
+            else:
                 raise ValueError(
-                    f"Unexpected snapshot format in {filepath}: expected "
-                    f"list, got {type(tensors)}")
+                    "Unexpected snapshot format in {}: got {}".format(
+                        filepath, type(loaded)))
+
             if len(tensors) != len(self.gpu_cache):
                 raise ValueError(
                     "Snapshot layer count mismatch: got "
@@ -177,6 +191,7 @@ class CacheEngine:
 
             logger.info("Loaded GPU KV cache from %s (layers=%d)", filepath,
                         len(tensors))
+            return meta
         except Exception:
             logger.exception("Failed to load GPU KV cache from %s", filepath)
             raise

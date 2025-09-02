@@ -5,7 +5,6 @@ import gc
 import os
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Set, Tuple, Type, Union
-
 import torch
 import torch.distributed
 
@@ -119,18 +118,19 @@ class Worker(LocalOrDistributedWorkerBase):
         else:
             self.profiler = None
 
-    # KV cache snapshot controls (single-GPU/simple use case).
-    # Set via environment variables to keep CLI integration minimal.
-    # VLLM_KV_SNAPSHOT_LOAD: file path to load before first execute
+        # KV cache snapshot controls (single-GPU/simple use case).
+        # Set via environment variables to keep CLI integration minimal.
+        # VLLM_KV_SNAPSHOT_LOAD: file path to load before first execute
     # VLLM_KV_SNAPSHOT_PATH: file path to save after first
     # successful prefill
-        self._kv_snapshot_load_path: Optional[str] = os.environ.get(
-            "VLLM_KV_SNAPSHOT_LOAD")
-        self._kv_snapshot_loaded: bool = False
-        self._kv_snapshot_path: Optional[str] = os.environ.get(
-            "VLLM_KV_SNAPSHOT_PATH")
-        self._kv_snapshot_done: bool = False
-        self._last_ve: Optional[int] = None
+        self._kv_snapshot_load_path = os.environ.get("VLLM_KV_SNAPSHOT_LOAD")
+        self._kv_snapshot_loaded = False
+        self._kv_snapshot_path = os.environ.get("VLLM_KV_SNAPSHOT_PATH")
+        self._kv_snapshot_done = False
+        self._last_ve = None
+        # Snapshot metadata for prefix reuse.
+        self._kv_snapshot_meta = None
+        self._kv_snapshot_applied = False
 
     def start_profile(self):
         if self.profiler is None:
@@ -350,9 +350,14 @@ class Worker(LocalOrDistributedWorkerBase):
                 and getattr(self, "cache_engine", None) is not None
                 and getattr(self, "gpu_cache", None) is not None):
             try:
+                loaded_meta: Optional[dict] = None
                 for ve in range(self.parallel_config.pipeline_parallel_size):
-                    self.cache_engine[ve].load_gpu_cache(
+                    meta = self.cache_engine[ve].load_gpu_cache(
                         self._kv_snapshot_load_path)
+                    if loaded_meta is None:
+                        loaded_meta = meta
+                # Store meta (single-GPU/PP assumed identical across VEs)
+                self._kv_snapshot_meta = loaded_meta
                 logger.info(
                     "Loaded KV cache snapshot from %s into %d VEs (startup)",
                     self._kv_snapshot_load_path,
@@ -538,6 +543,67 @@ class Worker(LocalOrDistributedWorkerBase):
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None,
     ) -> Optional[List[SamplerOutput]]:
+        # If a KV snapshot with meta is loaded, attempt one-time attach:
+        # - Copy snapshot blocks into scheduler-allocated blocks for matching
+        #   prompt (by token-ids) and mark computed_block_nums to trigger
+        #   prefix cache hit, avoiding prefill compute.
+        if (execute_model_req is not None and self._kv_snapshot_meta
+                and not self._kv_snapshot_applied
+                and len(execute_model_req.seq_group_metadata_list) > 0):
+            try:
+                sg = execute_model_req.seq_group_metadata_list[0]
+                # Only attach for prompt stage.
+                if getattr(sg, "is_prompt", False):
+                    # Extract first (and only) seq id and token ids.
+                    first_seq_id = next(iter(sg.seq_data))
+                    seq_data = sg.seq_data[first_seq_id]
+                    prompt_token_ids = seq_data.get_token_ids()
+                    meta = self._kv_snapshot_meta or {}
+                    saved_tokens = meta.get("prompt_token_ids")
+                    # Match either exact list or a provided hash.
+                    ok = False
+                    if isinstance(saved_tokens, list):
+                        ok = (prompt_token_ids == saved_tokens)
+                    else:
+                        # Fallback: match by length if no tokens were saved.
+                        saved_len = meta.get("prompt_len")
+                        ok = (saved_len is not None and
+                              len(prompt_token_ids) == saved_len)
+
+                    if ok:
+                        # Determine number of blocks from meta.
+                        block_size = int(meta.get("block_size",
+                                                  self.cache_config.block_size))
+                        num_prompt_tokens = len(prompt_token_ids)
+                        num_blocks = int(meta.get(
+                            "num_blocks_used",
+                            (num_prompt_tokens + block_size - 1) //
+                            block_size))
+                        # Destination GPU block ids allocated by scheduler.
+                        dst_block_ids: List[int] = sg.block_tables[first_seq_id]
+                        if len(dst_block_ids) < num_blocks:
+                            num_blocks = len(dst_block_ids)
+                        # Source snapshot block ids saved during snapshot.
+                        src_block_ids = meta.get("src_block_ids") or list(
+                            range(num_blocks))
+                        pairs = [(int(src_block_ids[i]), int(dst_block_ids[i]))
+                                 for i in range(num_blocks)]
+                        if pairs:
+                            ve = execute_model_req.virtual_engine
+                            src_to_dsts = torch.tensor(
+                                pairs,
+                                device=self.device,
+                                dtype=torch.int64)
+                            self.cache_engine[ve].copy(src_to_dsts)
+                        # Mark computed blocks for prefix cache hit.
+                        sg.computed_block_nums = list(range(num_blocks))
+                        self._kv_snapshot_applied = True
+                        logger.info(
+                            "Attached KV snapshot to request %s: "
+                            "reused %d blocks", sg.request_id, num_blocks)
+            except Exception:
+                logger.exception(
+                    "Failed to attach KV snapshot to incoming prompt")
         # Delegate to base execution.
         output = super().execute_model(execute_model_req)
 
@@ -547,8 +613,42 @@ class Worker(LocalOrDistributedWorkerBase):
                 and output is not None and output != []):
             try:
                 ve = self._last_ve if self._last_ve is not None else 0
+                # Build snapshot metadata for reuse.
+                meta: dict = {
+                    "version": 1,
+                    "model": str(self.model_config.model),
+                    "dtype": str(self.model_config.dtype),
+                    "block_size": int(self.cache_config.block_size),
+                    "num_layers": int(self.model_config.get_num_layers(
+                        self.parallel_config)),
+                    "num_kv_heads": int(self.model_config.get_num_kv_heads(
+                        self.parallel_config)),
+                    "head_size": int(self.model_config.get_head_size()),
+                    "pp_size": int(self.parallel_config.pipeline_parallel_size),
+                    "tp_size": int(self.parallel_config.tensor_parallel_size),
+                }
+                # If we have the request, persist prompt identity
+                # and block usage.
+                if (execute_model_req is not None and
+                        len(execute_model_req.seq_group_metadata_list) > 0):
+                    sg = execute_model_req.seq_group_metadata_list[0]
+                    if getattr(sg, "is_prompt", False):
+                        first_seq_id = next(iter(sg.seq_data))
+                        seq_data = sg.seq_data[first_seq_id]
+                        tokens = seq_data.get_token_ids()
+                        meta["prompt_token_ids"] = tokens
+                        prompt_len = len(tokens)
+                        meta["prompt_len"] = prompt_len
+                        bs = meta["block_size"]
+                        meta["num_blocks_used"] = (prompt_len + bs - 1) // bs
+                        # Save source block ids used by this prompt.
+                        src_block_ids = sg.block_tables.get(first_seq_id, [])
+                        # Shallow copy and truncate to num_blocks_used.
+                        if src_block_ids:
+                            meta["src_block_ids"] = list(
+                                src_block_ids[:meta["num_blocks_used"]])
                 self.cache_engine[ve].save_gpu_cache(
-                    self._kv_snapshot_path)
+                    self._kv_snapshot_path, meta)
                 logger.info("Saved KV cache snapshot to %s (ve=%d)",
                             self._kv_snapshot_path, ve)
                 self._kv_snapshot_done = True
